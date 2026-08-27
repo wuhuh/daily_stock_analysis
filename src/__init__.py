@@ -17,3 +17,13 @@ if os.path.basename(sys.argv[0] or "") == "main.py":
         import sitecustomize  # noqa: F401
     except ImportError:
         pass
+
+    # Fork-local runtime extensions are kept separate from upstream modules so
+    # they remain easy to review/rebase: Exa MCP news search plus balanced
+    # leading/lagging sector coverage for brief Enterprise WeChat reports.
+    try:
+        from src.opencode_go_extensions import install as _install_opencode_go_extensions
+
+        _install_opencode_go_extensions()
+    except ImportError:
+        pass
