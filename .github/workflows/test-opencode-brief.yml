@@ -1,4 +1,4 @@
-name: OpenCode Go Endpoint Probe
+name: OpenCode Go Brief Smoke Test
 
 on:
   push:
@@ -6,9 +6,15 @@ on:
       - fix/opencode-go-brief-wechat
 
 jobs:
-  probe:
+  market-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    environment: STOCK_LIST
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        region: [cn, us]
+
     steps:
       - uses: actions/checkout@v5
 
@@ -17,78 +23,80 @@ jobs:
           python-version: '3.11'
           cache: pip
 
-      - name: Install minimal probe dependencies
-        run: pip install 'litellm>=1.80.10,<2.0.0' requests
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Probe OpenCode Go MiniMax M3
+      - name: Run concise market review
         env:
-          OPENCODE_GO_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # sitecustomize.py is intentionally loaded from the repository root.
+          PYTHONPATH: ${{ github.workspace }}
+          GENERATION_BACKEND: litellm
+          GENERATION_FALLBACK_BACKEND: litellm
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: minimax-m3
+          REPORT_TYPE: brief
+          REPORT_LANGUAGE: zh
+          MARKET_REVIEW_ENABLED: 'true'
+          MARKET_REVIEW_REGION: ${{ matrix.region }}
+          TRADING_DAY_CHECK_ENABLED: 'false'
+          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+          WECHAT_MSG_TYPE: markdown
+          SEARXNG_PUBLIC_INSTANCES_ENABLED: 'false'
+        run: |
+          mkdir -p reports logs data
+          set -o pipefail
+          python main.py --market-review --force-run 2>&1 | tee logs/smoke-${{ matrix.region }}.log
+
+      - name: Assert real MiniMax route and WeChat-friendly output
         run: |
           python - <<'PY'
-          import os
-          import requests
-          import litellm
+          from pathlib import Path
+          import sys
 
-          key = os.environ['OPENCODE_GO_API_KEY']
-          exact = 'https://opencode.ai/zen/go/v1/messages'
-          payload = {
-              'model': 'minimax-m3',
-              'max_tokens': 12,
-              'messages': [{'role': 'user', 'content': 'Reply exactly: OK'}],
-          }
+          region = '${{ matrix.region }}'
+          log = Path(f'logs/smoke-{region}.log').read_text(encoding='utf-8', errors='replace')
+          reports = sorted(Path('reports').glob('market_review_*.md'))
+          if not reports:
+              raise SystemExit('No market review report generated')
 
-          def safe_body(resp):
-              text = (resp.text or '').replace('\n', ' ')
-              return text[:240]
+          text = reports[-1].read_text(encoding='utf-8', errors='replace')
+          print('report:', reports[-1])
+          print('chars:', len(text))
+          print('bytes:', len(text.encode('utf-8')))
+          print(text[:1600])
 
-          print('=== Raw Anthropic Messages endpoint ===')
-          raw_success = False
-          header_variants = [
-              ('x-api-key', {
-                  'x-api-key': key,
-                  'anthropic-version': '2023-06-01',
-                  'content-type': 'application/json',
-              }),
-              ('bearer', {
-                  'authorization': f'Bearer {key}',
-                  'anthropic-version': '2023-06-01',
-                  'content-type': 'application/json',
-              }),
+          required = [
+              'anthropic/minimax-m3',
+              'action=generate_review status=success',
+              '企业微信消息发送成功',
           ]
-          for label, headers in header_variants:
-              try:
-                  resp = requests.post(exact, headers=headers, json=payload, timeout=30)
-                  print(f'RAW {label}: status={resp.status_code} content_type={resp.headers.get("content-type", "")} body={safe_body(resp)}')
-                  if 200 <= resp.status_code < 300:
-                      raw_success = True
-              except Exception as exc:
-                  print(f'RAW {label}: {type(exc).__name__}: {str(exc)[:240]}')
+          forbidden = [
+              'openai/minimax-m3 failed',
+              'anthropic/minimax-m3 failed',
+              'fallback_template reason=empty_llm_response',
+              'authenticationerror',
+          ]
+          missing = [item for item in required if item.lower() not in log.lower()]
+          bad = [item for item in forbidden if item.lower() in log.lower()]
+          tables = [line for line in text.splitlines() if line.lstrip().startswith('|')]
 
-          print('=== LiteLLM Anthropic api_base candidates ===')
-          litellm_success = False
-          for base in [
-              'https://opencode.ai/zen/go/v1',
-              'https://opencode.ai/zen/go',
-              'https://opencode.ai/zen/go/v1/messages',
-          ]:
-              try:
-                  response = litellm.completion(
-                      model='anthropic/minimax-m3',
-                      api_base=base,
-                      api_key=key,
-                      messages=[{'role': 'user', 'content': 'Reply exactly: OK'}],
-                      max_tokens=12,
-                      timeout=30,
-                  )
-                  text = response.choices[0].message.content
-                  print(f'LITELLM SUCCESS base={base} response={str(text)[:100]}')
-                  litellm_success = True
-                  break
-              except Exception as exc:
-                  print(f'LITELLM FAIL base={base} {type(exc).__name__}: {str(exc)[:400]}')
-
-          if not raw_success:
-              raise SystemExit('Exact OpenCode Go /v1/messages endpoint did not accept the configured key/header variants')
-          if not litellm_success:
-              raise SystemExit('No LiteLLM Anthropic api_base candidate succeeded')
+          if missing or bad:
+              print('Missing required evidence:', missing)
+              print('Forbidden error/fallback evidence:', bad)
+              sys.exit(1)
+          if len(text) > 1400:
+              raise SystemExit(f'Report is too long for WeChat brief mode: {len(text)} chars')
+          if tables:
+              raise SystemExit('Brief report still contains Markdown tables')
           PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opencode-brief-${{ matrix.region }}-${{ github.run_attempt }}
+          path: |
+            reports/
+            logs/
+          if-no-files-found: warn
