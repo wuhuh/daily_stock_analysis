@@ -3,7 +3,7 @@ name: OpenCode Go Brief Smoke Test
 on:
   push:
     branches:
-      - fix/opencode-go-brief-wechat
+      - fix/opencode-go-brief-wechat-final
 
 jobs:
   market-smoke:
@@ -41,7 +41,6 @@ jobs:
           TRADING_DAY_CHECK_ENABLED: 'false'
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
           WECHAT_MSG_TYPE: markdown
-          SEARXNG_PUBLIC_INSTANCES_ENABLED: 'false'
         run: |
           mkdir -p reports logs data
           set -o pipefail
@@ -75,6 +74,7 @@ jobs:
               'anthropic/minimax-m3 failed',
               'fallback_template reason=empty_llm_response',
               'authenticationerror',
+              'reason=no_search_service',
           ]
           missing = [item for item in required if item.lower() not in log.lower()]
           bad = [item for item in forbidden if item.lower() in log.lower()]
