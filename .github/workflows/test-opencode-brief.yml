@@ -30,8 +30,6 @@ jobs:
 
       - name: Run concise market review
         env:
-          # sitecustomize.py is intentionally loaded from the repository root.
-          PYTHONPATH: ${{ github.workspace }}
           GENERATION_BACKEND: litellm
           GENERATION_FALLBACK_BACKEND: litellm
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
