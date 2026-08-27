@@ -27,3 +27,14 @@ if os.path.basename(sys.argv[0] or "") == "main.py":
         _install_opencode_go_extensions()
     except ImportError:
         pass
+
+    # The hosted keyless Exa tool currently returns publication metadata as a
+    # ``Published:`` line in its text payload. Install the small compatibility
+    # provider after the generic extension so dated news survives the project's
+    # existing freshness filter.
+    try:
+        from src.opencode_go_exa_public_fix import install as _install_public_exa_fix
+
+        _install_public_exa_fix()
+    except ImportError:
+        pass
