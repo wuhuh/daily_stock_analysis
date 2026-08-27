@@ -1,0 +1,93 @@
+name: US Sector Balance Smoke
+
+on:
+  push:
+    branches:
+      - feat/us-sector-balance
+
+jobs:
+  us-sector-smoke:
+    runs-on: ubuntu-latest
+    environment: STOCK_LIST
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run US market review
+        env:
+          GENERATION_BACKEND: litellm
+          GENERATION_FALLBACK_BACKEND: litellm
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: minimax-m3
+          REPORT_TYPE: brief
+          REPORT_LANGUAGE: zh
+          MARKET_REVIEW_ENABLED: 'true'
+          MARKET_REVIEW_REGION: us
+          TRADING_DAY_CHECK_ENABLED: 'false'
+          EXA_MCP_SEARCH_ENABLED: 'true'
+          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+          WECHAT_MSG_TYPE: markdown
+        run: |
+          mkdir -p reports logs data
+          set -o pipefail
+          python main.py --market-review --force-run 2>&1 | tee logs/us-sector-smoke.log
+
+      - name: Assert US sector rankings and concise report
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          log = Path('logs/us-sector-smoke.log').read_text(encoding='utf-8', errors='replace')
+          reports = sorted(Path('reports').glob('market_review_*.md'))
+          if not reports:
+              raise SystemExit('No US market review generated')
+          text = reports[-1].read_text(encoding='utf-8', errors='replace')
+
+          print('chars:', len(text))
+          print('bytes:', len(text.encode('utf-8')))
+          print(text[:1800])
+
+          required_log = [
+              '已启用美股 11 Sector SPDR ETF 领涨/领跌分析',
+              '[USSector] rankings success',
+              'anthropic/minimax-m3',
+              'action=generate_review status=success',
+              '企业微信消息发送成功',
+          ]
+          missing = [x for x in required_log if x.lower() not in log.lower()]
+          if missing:
+              raise SystemExit(f'Missing evidence: {missing}')
+
+          for label in ('**领涨**', '**领跌**'):
+              if label not in text:
+                  raise SystemExit(f'Missing US sector block: {label}')
+          if '**主线**' in text:
+              raise SystemExit('US brief still uses old mainline-only block')
+          if not re.search(r'\((?:XLK|XLC|XLY|XLF|XLI|XLB|XLE|XLP|XLV|XLU|XLRE)\)', text):
+              raise SystemExit('US sector block does not show ETF proxy tickers')
+          if len(text) > 1400:
+              raise SystemExit(f'Report too long: {len(text)} chars')
+          if any(line.lstrip().startswith('|') for line in text.splitlines()):
+              raise SystemExit('Brief report contains Markdown table')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: us-sector-smoke-${{ github.run_attempt }}
+          path: |
+            reports/
+            logs/
+          if-no-files-found: warn
