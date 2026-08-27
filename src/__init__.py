@@ -38,3 +38,13 @@ if os.path.basename(sys.argv[0] or "") == "main.py":
         _install_public_exa_fix()
     except ImportError:
         pass
+
+    # US market sector breadth: use the 11 Select Sector SPDR ETFs as liquid
+    # GICS-sector proxies and inject deterministic leading/lagging blocks into
+    # the concise market review.
+    try:
+        from src.us_sector_extension import install as _install_us_sector_extension
+
+        _install_us_sector_extension()
+    except ImportError:
+        pass
