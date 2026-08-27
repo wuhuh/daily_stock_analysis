@@ -14,7 +14,10 @@ import sys
 from typing import Dict, List
 
 
-_OPENCODE_GO_ANTHROPIC_BASE = "https://opencode.ai/zen/go/v1"
+# OpenCode Go exposes MiniMax M3 at
+# https://opencode.ai/zen/go/v1/messages.  LiteLLM's Anthropic adapter appends
+# /v1/messages to api_base, so the configured base must stop at /zen/go.
+_OPENCODE_GO_ANTHROPIC_BASE = "https://opencode.ai/zen/go"
 _OPENCODE_GO_MINIMAX_MODEL = "minimax-m3"
 
 
@@ -28,11 +31,10 @@ def _is_brief_mode() -> bool:
 
 
 def _configure_opencode_go_minimax() -> None:
-    """Reuse the existing OPENAI_API_KEY for OpenCode Go MiniMax M3.
+    """Reuse OPENAI_API_KEY for the user's OpenCode Go MiniMax M3 key.
 
-    OpenCode Go exposes MiniMax M3 on the Anthropic Messages surface.  LiteLLM
-    expects ``api_base`` to stop at ``/v1`` and appends ``/messages`` itself,
-    yielding the documented endpoint ``.../zen/go/v1/messages``.
+    The upstream API is Anthropic Messages and authenticates with ``x-api-key``.
+    LiteLLM handles that header when the route uses the Anthropic provider.
     """
 
     model = (os.getenv("OPENAI_MODEL") or "").strip().lower()
