@@ -30,21 +30,23 @@ jobs:
 
       - name: Verify runtime routing
         env:
+          PYTHONPATH: ${{ github.workspace }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: minimax-m3
           REPORT_TYPE: brief
         run: |
           python - <<'PY'
           import os
-          import runpy
-          # sitecustomize only applies production patches to main.py, so this
-          # step only confirms the source file exists before the real run.
-          print('sitecustomize exists:', os.path.exists('sitecustomize.py'))
           print('OPENAI_MODEL:', os.getenv('OPENAI_MODEL'))
+          print('LLM_CHANNELS:', os.getenv('LLM_CHANNELS'))
+          print('LLM_MINIMAX_PROTOCOL:', os.getenv('LLM_MINIMAX_PROTOCOL'))
+          print('LLM_MINIMAX_BASE_URL:', os.getenv('LLM_MINIMAX_BASE_URL'))
+          print('LITELLM_MODEL:', os.getenv('LITELLM_MODEL'))
           PY
 
       - name: Run brief market review
         env:
+          PYTHONPATH: ${{ github.workspace }}
           GENERATION_BACKEND: litellm
           GENERATION_FALLBACK_BACKEND: litellm
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -59,13 +61,13 @@ jobs:
           SEARXNG_PUBLIC_INSTANCES_ENABLED: 'false'
         run: |
           mkdir -p reports logs data
+          set -o pipefail
           python main.py --market-review --force-run 2>&1 | tee logs/smoke-${{ matrix.region }}.log
 
-      - name: Assert OpenCode Go route and concise report
+      - name: Assert real OpenCode Go route and concise report
         run: |
           python - <<'PY'
           from pathlib import Path
-          import re
           import sys
 
           region = '${{ matrix.region }}'
@@ -80,9 +82,20 @@ jobs:
           print('bytes:', len(text.encode('utf-8')))
           print(text[:1400])
 
-          route_ok = ('anthropic/minimax-m3' in log) or ('provider=anthropic' in log.lower()) or ('minimax-m3' in log.lower())
-          if not route_ok:
-              print('OpenCode/Anthropic route was not visible in logs')
+          required = [
+              'anthropic/minimax-m3',
+              'action=generate_review status=success',
+          ]
+          missing = [item for item in required if item.lower() not in log.lower()]
+          forbidden = [
+              'openai/minimax-m3 failed',
+              'fallback_template reason=empty_llm_response',
+              'authenticationerror',
+          ]
+          found_forbidden = [item for item in forbidden if item.lower() in log.lower()]
+          if missing or found_forbidden:
+              print('Missing required evidence:', missing)
+              print('Forbidden fallback/error evidence:', found_forbidden)
               sys.exit(1)
           if len(text) > 1400:
               print('Report is still too long for the brief target')
