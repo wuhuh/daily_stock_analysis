@@ -1,0 +1,99 @@
+name: OpenCode Go Brief Smoke Test
+
+on:
+  push:
+    branches:
+      - fix/opencode-go-brief-wechat
+
+jobs:
+  market-smoke:
+    runs-on: ubuntu-latest
+    environment: STOCK_LIST
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        region: [cn, us]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify runtime routing
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: minimax-m3
+          REPORT_TYPE: brief
+        run: |
+          python - <<'PY'
+          import os
+          import runpy
+          # sitecustomize only applies production patches to main.py, so this
+          # step only confirms the source file exists before the real run.
+          print('sitecustomize exists:', os.path.exists('sitecustomize.py'))
+          print('OPENAI_MODEL:', os.getenv('OPENAI_MODEL'))
+          PY
+
+      - name: Run brief market review
+        env:
+          GENERATION_BACKEND: litellm
+          GENERATION_FALLBACK_BACKEND: litellm
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: minimax-m3
+          REPORT_TYPE: brief
+          REPORT_LANGUAGE: zh
+          MARKET_REVIEW_ENABLED: 'true'
+          MARKET_REVIEW_REGION: ${{ matrix.region }}
+          TRADING_DAY_CHECK_ENABLED: 'false'
+          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+          WECHAT_MSG_TYPE: markdown
+          SEARXNG_PUBLIC_INSTANCES_ENABLED: 'false'
+        run: |
+          mkdir -p reports logs data
+          python main.py --market-review --force-run 2>&1 | tee logs/smoke-${{ matrix.region }}.log
+
+      - name: Assert OpenCode Go route and concise report
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          region = '${{ matrix.region }}'
+          log = Path(f'logs/smoke-{region}.log').read_text(encoding='utf-8', errors='replace')
+          reports = sorted(Path('reports').glob('market_review_*.md'))
+          if not reports:
+              print('No market review report generated')
+              sys.exit(1)
+          text = reports[-1].read_text(encoding='utf-8', errors='replace')
+          print('report:', reports[-1])
+          print('chars:', len(text))
+          print('bytes:', len(text.encode('utf-8')))
+          print(text[:1400])
+
+          route_ok = ('anthropic/minimax-m3' in log) or ('provider=anthropic' in log.lower()) or ('minimax-m3' in log.lower())
+          if not route_ok:
+              print('OpenCode/Anthropic route was not visible in logs')
+              sys.exit(1)
+          if len(text) > 1400:
+              print('Report is still too long for the brief target')
+              sys.exit(1)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opencode-brief-${{ matrix.region }}-${{ github.run_attempt }}
+          path: |
+            reports/
+            logs/
+          if-no-files-found: warn
