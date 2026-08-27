@@ -6,6 +6,52 @@ on:
       - feat/exa-news-sector-balance
 
 jobs:
+  exa-public-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect keyless web_search_exa response
+        run: |
+          python - <<'PY'
+          import json
+          import urllib.request
+
+          endpoint = 'https://mcp.exa.ai/mcp'
+          queries = [
+              'category:news S&P 500 NASDAQ August 27 2026',
+              'category:news A股 市场 今日 2026-08-27',
+          ]
+          for idx, query in enumerate(queries, 1):
+              payload = {
+                  'jsonrpc': '2.0',
+                  'id': idx,
+                  'method': 'tools/call',
+                  'params': {
+                      'name': 'web_search_exa',
+                      'arguments': {'query': query, 'numResults': 3},
+                  },
+              }
+              req = urllib.request.Request(
+                  endpoint,
+                  data=json.dumps(payload).encode('utf-8'),
+                  headers={
+                      'Content-Type': 'application/json',
+                      'Accept': 'application/json, text/event-stream',
+                      'User-Agent': 'daily-stock-analysis/exa-probe',
+                  },
+                  method='POST',
+              )
+              print(f'=== QUERY {idx}: {query} ===')
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as response:
+                      body = response.read().decode('utf-8', errors='replace')
+                      print('status:', response.status)
+                      print('content-type:', response.headers.get('content-type'))
+                      print(body[:7000])
+              except Exception as exc:
+                  print('probe-error:', repr(exc))
+          PY
+
   market-smoke:
     runs-on: ubuntu-latest
     environment: STOCK_LIST
