@@ -1,15 +1,11 @@
 # -*- coding: utf-8 -*-
-"""OpenCode Go runtime extensions for the daily-analysis entrypoint.
+"""Fork-local OpenCode Go extensions used by ``python main.py``.
 
-This module is loaded only by ``src.__init__`` when ``python main.py`` is the
-entrypoint.  It keeps fork-specific integration changes isolated from upstream
-search/report code:
+The extension keeps two production customizations isolated from upstream code:
 
-1. Add the hosted Exa MCP ``web_search_exa`` tool as the first keyless search
-   provider.  Existing providers, including SearXNG, remain fallback options.
-2. Make A-share brief reports explicitly cover both leading and lagging sectors
-   so Enterprise WeChat summaries do not collapse sector analysis into only the
-   strongest theme.
+* Exa hosted MCP is the first news-search provider; the repository's existing
+  providers (including SearXNG) remain fail-open fallbacks.
+* A-share brief reports always cover both leading and lagging sectors.
 """
 
 from __future__ import annotations
@@ -19,6 +15,7 @@ import logging
 import os
 import re
 import time
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -26,7 +23,7 @@ import requests
 
 
 logger = logging.getLogger(__name__)
-_EXA_MCP_URL = "https://mcp.exa.ai/mcp?tools=web_search_exa"
+_EXA_MCP_URL = "https://mcp.exa.ai/mcp?tools=web_search_advanced_exa"
 _EXA_PROVIDER_NAME = "ExaMCP"
 
 
@@ -38,15 +35,19 @@ def _is_enabled(name: str, *, default: bool = True) -> bool:
 
 
 def _is_brief_mode() -> bool:
-    report_type = (
+    value = (
         os.getenv("MARKET_REVIEW_REPORT_TYPE")
         or os.getenv("REPORT_TYPE")
         or ""
     ).strip().lower()
-    return report_type in {"simple", "brief"}
+    return value in {"simple", "brief"}
 
 
-def _parse_json_object(raw: str) -> Optional[Dict[str, Any]]:
+def _json_object(raw: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return None
     try:
         value = json.loads(raw)
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -55,64 +56,73 @@ def _parse_json_object(raw: str) -> Optional[Dict[str, Any]]:
 
 
 def _parse_mcp_envelope(body: str) -> Optional[Dict[str, Any]]:
-    """Parse a Streamable-HTTP MCP response in JSON or SSE form."""
+    """Return the result-bearing JSON-RPC message from JSON or SSE output."""
     text = str(body or "").strip()
     if not text:
         return None
 
-    direct = _parse_json_object(text)
+    direct = _json_object(text)
     if direct is not None:
         return direct
 
+    candidates: List[Dict[str, Any]] = []
     for line in text.splitlines():
         if not line.startswith("data:"):
             continue
         payload = line[5:].strip()
         if not payload or payload == "[DONE]":
             continue
-        parsed = _parse_json_object(payload)
+        parsed = _json_object(payload)
         if parsed is not None:
-            return parsed
-    return None
+            candidates.append(parsed)
+
+    # Streamable HTTP may emit progress/metadata events before the actual tool
+    # result.  Prefer the last result/error message instead of the first event.
+    for item in reversed(candidates):
+        if "result" in item or "error" in item:
+            return item
+    return candidates[-1] if candidates else None
 
 
-def _find_structured_results(value: Any) -> Optional[List[Dict[str, Any]]]:
-    """Find an Exa ``results`` array in nested MCP/structured content."""
+def _find_results(value: Any) -> Optional[List[Dict[str, Any]]]:
+    """Find Exa's structured ``results`` array in an MCP response."""
     if isinstance(value, dict):
-        raw_results = value.get("results")
-        if isinstance(raw_results, list):
-            return [item for item in raw_results if isinstance(item, dict)]
+        rows = value.get("results")
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)]
 
-        for key in ("structuredContent", "data", "result"):
-            nested = _find_structured_results(value.get(key))
-            if nested is not None:
-                return nested
-
+        # Advanced Exa MCP commonly serializes its structured payload into a
+        # text content item.  Decode JSON-looking text before falling back.
         content = value.get("content")
         if isinstance(content, list):
             for item in content:
                 if not isinstance(item, dict):
                     continue
-                nested = _find_structured_results(item)
+                nested = _find_results(item)
                 if nested is not None:
                     return nested
-                raw_text = item.get("text")
-                if isinstance(raw_text, str):
-                    parsed = _parse_json_object(raw_text.strip())
-                    if parsed is not None:
-                        nested = _find_structured_results(parsed)
-                        if nested is not None:
-                            return nested
+                text = item.get("text")
+                parsed = _json_object(text)
+                if parsed is not None:
+                    nested = _find_results(parsed)
+                    if nested is not None:
+                        return nested
+
+        for key in ("structuredContent", "data", "result"):
+            if key in value:
+                nested = _find_results(value[key])
+                if nested is not None:
+                    return nested
 
     if isinstance(value, list):
         for item in value:
-            nested = _find_structured_results(item)
+            nested = _find_results(item)
             if nested is not None:
                 return nested
     return None
 
 
-def _collect_mcp_text(value: Any) -> str:
+def _collect_text(value: Any) -> str:
     blocks: List[str] = []
 
     def visit(node: Any) -> None:
@@ -121,9 +131,9 @@ def _collect_mcp_text(value: Any) -> str:
             if isinstance(content, list):
                 for item in content:
                     if isinstance(item, dict):
-                        raw_text = item.get("text")
-                        if isinstance(raw_text, str) and raw_text.strip():
-                            blocks.append(raw_text.strip())
+                        text = item.get("text")
+                        if isinstance(text, str) and text.strip():
+                            blocks.append(text.strip())
             for key in ("structuredContent", "data", "result"):
                 if key in node:
                     visit(node[key])
@@ -135,53 +145,30 @@ def _collect_mcp_text(value: Any) -> str:
     return "\n\n".join(blocks)
 
 
-def _parse_optional_field(section: str, label: str) -> Optional[str]:
-    match = re.search(rf"(?:^|\n){re.escape(label)}:\s*([^\n]*)", section)
-    if not match:
-        return None
-    value = match.group(1).strip()
-    return value or None
+def _parse_text_results(text: str) -> List[Dict[str, Any]]:
+    """Compatibility parser for Exa's Title/URL/Published Date text format."""
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    matches = list(re.finditer(r"(?m)^Title:\s*([^\n]+)", normalized))
+    rows: List[Dict[str, Any]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
+        section = normalized[match.start():end]
 
+        def field(label: str) -> Optional[str]:
+            found = re.search(rf"(?m)^{re.escape(label)}:\s*([^\n]*)", section)
+            value = found.group(1).strip() if found else ""
+            return value or None
 
-def _parse_exa_text_results(text: str) -> List[Dict[str, Any]]:
-    """Parse the text form returned by hosted Exa MCP.
-
-    Exa commonly returns blocks shaped as ``Title / URL / Author /
-    Published Date / Text``.  Parsing by title boundaries also tolerates an
-    omitted author/date and the newer ``Highlights`` fallback.
-    """
-    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not normalized:
-        return []
-
-    title_matches = list(re.finditer(r"(?m)^Title:\s*([^\n]*)", normalized))
-    results: List[Dict[str, Any]] = []
-    for index, match in enumerate(title_matches):
-        end = title_matches[index + 1].start() if index + 1 < len(title_matches) else len(normalized)
-        section = normalized[match.start():end].strip().strip("-").strip()
-        title = match.group(1).strip()
-        url = _parse_optional_field(section, "URL")
-        author = _parse_optional_field(section, "Author")
-        published_date = _parse_optional_field(section, "Published Date")
-
-        text_match = re.search(r"(?:^|\n)Text:\s*([\s\S]*)$", section)
-        snippet = text_match.group(1).strip() if text_match else ""
-        if not snippet:
-            highlights_match = re.search(r"(?:^|\n)Highlights?:\s*([\s\S]*)$", section)
-            snippet = highlights_match.group(1).strip() if highlights_match else ""
-        snippet = re.sub(r"\n-{3,}\s*$", "", snippet).strip()
-
-        if title or url or snippet:
-            results.append(
-                {
-                    "title": title,
-                    "url": url,
-                    "author": author,
-                    "publishedDate": published_date,
-                    "text": snippet,
-                }
-            )
-    return results
+        body_match = re.search(r"(?ms)^Text:\s*(.*)$", section)
+        rows.append(
+            {
+                "title": match.group(1).strip(),
+                "url": field("URL"),
+                "publishedDate": field("Published Date"),
+                "text": body_match.group(1).strip() if body_match else "",
+            }
+        )
+    return rows
 
 
 def _extract_exa_results(envelope: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -191,23 +178,44 @@ def _extract_exa_results(envelope: Dict[str, Any]) -> List[Dict[str, Any]]:
     if error:
         raise RuntimeError(str(error))
 
-    result = envelope.get("result", envelope)
-    structured = _find_structured_results(result)
-    if structured is not None:
-        return structured
+    payload = envelope.get("result", envelope)
+    rows = _find_results(payload)
+    if rows is not None:
+        return rows
+    return _parse_text_results(_collect_text(payload))
 
-    return _parse_exa_text_results(_collect_mcp_text(result))
+
+def _first_value(mapping: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, ""):
+            return value
+    metadata = mapping.get("metadata")
+    if isinstance(metadata, dict):
+        for key in keys:
+            value = metadata.get(key)
+            if value not in (None, ""):
+                return value
+    return None
 
 
-def _normalize_published_date(value: Any) -> Optional[str]:
-    raw = str(value or "").strip()
-    if not raw:
+def _published_date(item: Dict[str, Any]) -> Optional[str]:
+    raw = _first_value(
+        item,
+        "publishedDate",
+        "published_date",
+        "publishedAt",
+        "published_at",
+        "date",
+    )
+    text = str(raw or "").strip()
+    if not text:
         return None
-    match = re.search(r"\d{4}-\d{2}-\d{2}", raw)
-    return match.group(0) if match else raw
+    match = re.search(r"\d{4}-\d{2}-\d{2}", text)
+    return match.group(0) if match else text
 
 
-def _source_from_url(url: str) -> str:
+def _source(url: str) -> str:
     try:
         return urlparse(url).netloc.removeprefix("www.") or "Exa"
     except Exception:
@@ -224,7 +232,7 @@ def _install_exa_search_provider() -> None:
         return
 
     class ExaMcpSearchProvider(BaseSearchProvider):
-        """Keyless hosted Exa MCP provider with optional EXA_API_KEY upgrade."""
+        """Hosted Exa advanced news search; no key required, key optional."""
 
         def __init__(self) -> None:
             super().__init__([], _EXA_PROVIDER_NAME)
@@ -234,8 +242,6 @@ def _install_exa_search_provider() -> None:
             return True
 
         def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
-            # BaseSearchProvider.search is overridden below, so this method is
-            # present only to satisfy the abstract interface.
             return self.search(query, max_results=max_results, days=days)
 
         def search(
@@ -245,7 +251,7 @@ def _install_exa_search_provider() -> None:
             days: int = 7,
             **_kwargs: Any,
         ) -> SearchResponse:
-            start = time.time()
+            started = time.time()
             requested = max(1, min(int(max_results or 5), 10))
             search_query = str(query or "").strip()
             if not search_query:
@@ -257,26 +263,28 @@ def _install_exa_search_provider() -> None:
                     error_message="搜索关键词为空",
                 )
 
-            # The simple Exa MCP tool supports an inline news category.  Add it
-            # for short freshness windows while keeping long-horizon analytical
-            # searches general-purpose.
-            exa_query = search_query
-            if days <= 30 and not search_query.lower().startswith("category:"):
-                exa_query = f"category:news {search_query}"
-
+            # Match the repository's freshness window at the search provider,
+            # rather than accepting undated results and pretending they are new.
+            window_days = max(1, int(days or 1))
+            today = date.today()
+            start_date = today - timedelta(days=window_days - 1)
+            end_date = today + timedelta(days=1)
+            arguments: Dict[str, Any] = {
+                "query": search_query,
+                "category": "news",
+                "numResults": requested,
+                "type": "auto",
+                "startPublishedDate": start_date.isoformat(),
+                "endPublishedDate": end_date.isoformat(),
+                "textMaxCharacters": 900,
+            }
             body = {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "tools/call",
                 "params": {
-                    "name": "web_search_exa",
-                    "arguments": {
-                        "query": exa_query,
-                        "type": "auto",
-                        "numResults": requested,
-                        "livecrawl": "fallback",
-                        "contextMaxCharacters": max(3000, requested * 900),
-                    },
+                    "name": "web_search_advanced_exa",
+                    "arguments": arguments,
                 },
             }
             headers = {
@@ -295,15 +303,15 @@ def _install_exa_search_provider() -> None:
                     json=body,
                     timeout=20,
                 )
-                elapsed = time.time() - start
+                elapsed = time.time() - started
                 if response.status_code != 200:
-                    error_text = (response.text or "").strip()[:300]
+                    detail = (response.text or "").strip()[:300]
                     return SearchResponse(
                         query=query,
                         results=[],
                         provider=self.name,
                         success=False,
-                        error_message=f"HTTP {response.status_code}: {error_text}",
+                        error_message=f"HTTP {response.status_code}: {detail}",
                         search_time=elapsed,
                     )
 
@@ -318,17 +326,15 @@ def _install_exa_search_provider() -> None:
                         search_time=elapsed,
                     )
 
-                raw_results = _extract_exa_results(envelope)
+                raw_rows = _extract_exa_results(envelope)
                 results: List[SearchResult] = []
-                for item in raw_results:
+                for item in raw_rows:
                     url = str(item.get("url") or "").strip()
                     if not url:
                         continue
                     title = str(item.get("title") or url).strip()
-                    summary = item.get("summary")
-                    text = item.get("text")
                     highlights = item.get("highlights")
-                    snippet = str(summary or text or "").strip()
+                    snippet = str(item.get("summary") or item.get("text") or "").strip()
                     if not snippet and isinstance(highlights, list):
                         snippet = " ".join(str(part) for part in highlights if part).strip()
                     snippet = re.sub(r"\s+", " ", snippet)[:700]
@@ -337,20 +343,22 @@ def _install_exa_search_provider() -> None:
                             title=title[:180],
                             snippet=snippet,
                             url=url,
-                            source=_source_from_url(url),
-                            published_date=_normalize_published_date(
-                                item.get("publishedDate") or item.get("published_date")
-                            ),
+                            source=_source(url),
+                            published_date=_published_date(item),
                         )
                     )
                     if len(results) >= requested:
                         break
 
+                dated = sum(1 for item in results if item.published_date)
                 logger.info(
-                    "[%s] 搜索 '%s' 完成，返回 %s 条结果，耗时 %.2fs%s",
+                    "[%s] 搜索 '%s' 完成，窗口=%s..%s，返回 %s 条（有日期 %s 条），耗时 %.2fs%s",
                     self.name,
                     search_query,
+                    start_date,
+                    end_date,
                     len(results),
+                    dated,
                     elapsed,
                     "（API Key）" if exa_key else "（公共 MCP）",
                 )
@@ -362,7 +370,7 @@ def _install_exa_search_provider() -> None:
                     search_time=elapsed,
                 )
             except Exception as exc:
-                elapsed = time.time() - start
+                elapsed = time.time() - started
                 logger.warning("[%s] 搜索失败: %s", self.name, exc)
                 return SearchResponse(
                     query=query,
@@ -377,15 +385,15 @@ def _install_exa_search_provider() -> None:
 
     def patched_init(self, *args: Any, **kwargs: Any) -> None:
         original_init(self, *args, **kwargs)
-        if not any(getattr(provider, "name", "") == _EXA_PROVIDER_NAME for provider in self._providers):
+        if not any(getattr(p, "name", "") == _EXA_PROVIDER_NAME for p in self._providers):
             self._providers.insert(0, ExaMcpSearchProvider())
-            logger.info("已启用 Exa MCP 公共新闻搜索，SearXNG/其他引擎作为后续兜底")
+            logger.info("已启用 Exa MCP 实时新闻搜索，SearXNG/其他引擎作为后续兜底")
 
     SearchService.__init__ = patched_init
     SearchService._opencode_exa_mcp_installed = True
 
 
-def _format_signed_pct(value: Any) -> str:
+def _signed_pct(value: Any) -> str:
     try:
         return f"{float(value):+.2f}%"
     except (TypeError, ValueError):
@@ -400,13 +408,12 @@ def _ranking_summary(rows: Any, *, limit: int = 2) -> str:
         if not isinstance(row, dict):
             continue
         name = str(row.get("name") or "").strip()
-        if not name:
-            continue
-        items.append(f"{name} {_format_signed_pct(row.get('change_pct'))}")
+        if name:
+            items.append(f"{name} {_signed_pct(row.get('change_pct'))}")
     return "；".join(items)
 
 
-def _insert_before_decision_tail(text: str, block: str) -> str:
+def _insert_before_tail(text: str, block: str) -> str:
     if not block:
         return text
     for marker in ("\n**消息**", "\n**关注**", "\n**风险**", "\n**结论**"):
@@ -417,7 +424,7 @@ def _insert_before_decision_tail(text: str, block: str) -> str:
 
 
 def _ensure_cn_sector_balance(text: str, overview: Any) -> str:
-    """Guarantee concise leading + lagging sector coverage from structured data."""
+    """Deterministically keep both strongest and weakest A-share sectors."""
     report = str(text or "").strip()
     if not report:
         return report
@@ -425,21 +432,18 @@ def _ensure_cn_sector_balance(text: str, overview: Any) -> str:
     top_rows = getattr(overview, "top_sectors", None) or getattr(overview, "top_concepts", None) or []
     bottom_rows = getattr(overview, "bottom_sectors", None) or getattr(overview, "bottom_concepts", None) or []
 
-    # The previous brief format called strongest themes ``主线``.  In A-share
-    # mode this is semantically the leading side, so relabel it once rather than
-    # keeping a duplicate Mainline + Leading block.
     if "**领涨**" not in report and "**主线**" in report:
         report = report.replace("**主线**", "**领涨**", 1)
 
     if "**领涨**" not in report:
-        top_summary = _ranking_summary(top_rows)
-        if top_summary:
-            report = _insert_before_decision_tail(report, f"**领涨** {top_summary}")
+        summary = _ranking_summary(top_rows)
+        if summary:
+            report = _insert_before_tail(report, f"**领涨** {summary}")
 
     if "**领跌**" not in report:
-        bottom_summary = _ranking_summary(bottom_rows)
-        if bottom_summary:
-            report = _insert_before_decision_tail(report, f"**领跌** {bottom_summary}")
+        summary = _ranking_summary(bottom_rows)
+        if summary:
+            report = _insert_before_tail(report, f"**领跌** {summary}")
 
     return report
 
@@ -450,24 +454,23 @@ def _install_balanced_sector_brief_patch() -> None:
     if getattr(MarketAnalyzer, "_opencode_sector_balance_installed", False):
         return
 
-    original_prompt_builder = MarketAnalyzer._build_review_prompt
+    original_prompt = MarketAnalyzer._build_review_prompt
 
-    def balanced_prompt_builder(self, overview, news):
-        prompt = original_prompt_builder(self, overview, news)
+    def balanced_prompt(self, overview, news):
+        prompt = original_prompt(self, overview, news)
         if not _is_brief_mode() or getattr(self, "region", "cn") != "cn":
             return prompt
-
         return prompt + """
 
 【A股板块双向覆盖规则｜优先级高于上面的简报格式】
 最终 A 股简报不能只写上涨主线，必须同时记录当日最强与最弱板块：
-- 将原来的“主线”拆成“领涨”和“领跌”两个独立信息块。
-- 领涨：从已提供的行业/概念领涨榜中选 1-2 个最强方向，写“板块 + 涨幅 + 一句话判断”。
-- 领跌：从已提供的行业/概念领跌榜中选 1-2 个最弱方向，写“板块 + 跌幅 + 一句话判断”。
+- 将原来的“主线”拆为“领涨”和“领跌”两个独立信息块。
+- 领涨：从输入的行业/概念领涨榜选 1-2 个最强方向，写“板块 + 涨幅 + 一句话判断”。
+- 领跌：从输入的行业/概念领跌榜选 1-2 个最弱方向，写“板块 + 跌幅 + 一句话判断”。
 - 涨跌幅必须来自输入数据；没有可靠新闻解释原因时，只做盘面判断，不得编造政策、资金或消息原因。
-- 关注与结论要同时考虑强势方向的持续性和弱势方向是否扩散。
-- 仍保持 900 字以内，禁止 Markdown 表格。
-- 信息块顺序固定为：市场、领涨、领跌、消息、关注、风险、结论。
+- 关注与结论同时考虑强势方向的持续性和弱势方向是否扩散。
+- 保持 900 字以内，禁止 Markdown 表格。
+- 顺序固定：市场、领涨、领跌、消息、关注、风险、结论。
 
 推荐格式：
 ## A股简报
@@ -485,7 +488,7 @@ def _install_balanced_sector_brief_patch() -> None:
 **结论** 一句话概括市场强弱、最强/最弱方向和操作节奏
 """
 
-    MarketAnalyzer._build_review_prompt = balanced_prompt_builder
+    MarketAnalyzer._build_review_prompt = balanced_prompt
 
     original_inject = MarketAnalyzer._inject_data_into_review
 
@@ -500,6 +503,5 @@ def _install_balanced_sector_brief_patch() -> None:
 
 
 def install() -> None:
-    """Install extensions after the existing sitecustomize compatibility layer."""
     _install_exa_search_provider()
     _install_balanced_sector_brief_patch()
