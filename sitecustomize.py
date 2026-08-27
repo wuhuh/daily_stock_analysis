@@ -129,7 +129,8 @@ def _compact_market_text(text: str, max_chars: int = 1150) -> str:
             if line.startswith(f"**{key}**") or any(
                 lower_line.startswith(f"**{token}") for token in keys if token.isascii()
             ):
-                buckets[key].append(_trim_inline(line, 190))
+                label_pattern = re.compile(r"^\*\*[^*]+\*\*\s*[:：]?\s*")
+                buckets[key].append(_trim_inline(label_pattern.sub("", line), 190))
                 matched_inline = True
                 break
         if matched_inline:
@@ -147,7 +148,7 @@ def _compact_market_text(text: str, max_chars: int = 1150) -> str:
         lines.append(f"> {summary}")
 
     for key in ("市场", "主线", "消息", "关注", "风险", "结论"):
-        items = buckets[key]
+        items = [item for item in buckets[key] if item]
         if not items:
             continue
         if len(items) == 1:
@@ -217,6 +218,32 @@ def _install_market_review_patch() -> None:
         return result
 
     MarketAnalyzer._generate_market_review_with_metadata = brief_generate
+
+    # Upstream injects statistics/index/sector Markdown tables after the LLM
+    # returns.  That is useful for full reports but defeats brief-mode output.
+    # In brief mode the LLM has already received all structured data, so keep
+    # its compact decision summary as-is and skip the redundant table injection.
+    original_inject = MarketAnalyzer._inject_data_into_review
+
+    def brief_inject(self, review, overview, news=None):
+        if _is_brief_mode():
+            return _compact_market_text(review)
+        return original_inject(self, review, overview, news)
+
+    MarketAnalyzer._inject_data_into_review = brief_inject
+
+    # Keep the no-LLM fallback readable too.  Without this guard the template
+    # contains the same dashboard/sector tables that brief mode is meant to
+    # avoid, so an upstream/provider outage could suddenly produce a long push.
+    original_template = MarketAnalyzer._generate_template_review
+
+    def brief_template(self, overview, news):
+        report = original_template(self, overview, news)
+        if _is_brief_mode():
+            return _compact_market_text(report)
+        return report
+
+    MarketAnalyzer._generate_template_review = brief_template
 
 
 def _install_notification_patch() -> None:
