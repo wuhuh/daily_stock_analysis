@@ -2,16 +2,14 @@ name: 每日股票分析
 
 on:
   schedule:
-    # A股：周一至周五，北京时间
-  
-    # 11:30 午间休市
-    - cron: '30 3 * * 1-5'
-  
-    # 15:00 收盘
-    - cron: '0 7 * * 1-5'
+    # GitHub cron 使用 UTC。以下时间对应北京时间（UTC+8）。
+    # 09:05：推送上一交易时段的美股大盘复盘（仅大盘）
+    - cron: '5 1 * * 1-5'
+    # 11:35：A股午间休市后，推送大盘 + 自选股
+    - cron: '35 3 * * 1-5'
+    # 15:10：A股收盘后，推送大盘 + 自选股
+    - cron: '10 7 * * 1-5'
 
-    - cron: '40 11 * * 1-5'
-  
   # 手动触发
   workflow_dispatch:
     inputs:
@@ -413,7 +411,8 @@ jobs:
           # ==========================================
           # 运行配置 ⬅️ 新增！
           # ==========================================
-          REPORT_TYPE: ${{ vars.REPORT_TYPE || secrets.REPORT_TYPE || 'simple' }}
+          # Secret 优先，确保显式设置的 Repository Secret 不会被同名 Variable 静默覆盖。
+          REPORT_TYPE: ${{ secrets.REPORT_TYPE || vars.REPORT_TYPE || 'simple' }}
           REPORT_LANGUAGE: ${{ vars.REPORT_LANGUAGE || secrets.REPORT_LANGUAGE || '' }}
           REPORT_SHOW_LLM_MODEL: ${{ vars.REPORT_SHOW_LLM_MODEL || secrets.REPORT_SHOW_LLM_MODEL || 'true' }}
           SINGLE_STOCK_NOTIFY: ${{ vars.SINGLE_STOCK_NOTIFY || secrets.SINGLE_STOCK_NOTIFY || 'false' }}
@@ -454,14 +453,46 @@ jobs:
             echo "✅ LITELLM 配置文件已写入: $LITELLM_CONFIG"
           fi
 
-          # 判断运行模式
-          MODE="${{ github.event.inputs.mode || 'full' }}"
+          # schedule 事件没有 workflow_dispatch inputs，需要依据 cron 明确选择市场和运行模式。
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            case "${{ github.event.schedule }}" in
+              "5 1 * * 1-5")
+                MODE="market-only"
+                export MARKET_REVIEW_REGION="us"
+                echo "🇺🇸 计划任务：美股大盘早报"
+                ;;
+              "35 3 * * 1-5")
+                MODE="full"
+                export MARKET_REVIEW_REGION="cn"
+                echo "🇨🇳 计划任务：A股午间分析"
+                ;;
+              "10 7 * * 1-5")
+                MODE="full"
+                export MARKET_REVIEW_REGION="cn"
+                echo "🇨🇳 计划任务：A股收盘分析"
+                ;;
+              *)
+                MODE="full"
+                echo "⚠️ 未识别的 schedule，使用 full 模式"
+                ;;
+            esac
+          else
+            MODE="${{ github.event.inputs.mode || 'full' }}"
+          fi
+
+          # 上游当前 aggregate renderer 中 simple/full 会共同进入 dashboard。
+          # 对自动/手动推送做兼容归一化，使用户配置 REPORT_TYPE=simple 时得到真正的短报告。
+          if [ "${REPORT_TYPE,,}" = "simple" ]; then
+            export REPORT_TYPE="brief"
+            echo "📝 REPORT_TYPE=simple 已按简洁推送兼容为 brief"
+          fi
           
           echo "=========================================="
-          echo "🚀 A股自选股智能分析系统"
+          echo "🚀 多市场股票智能分析系统"
           echo "=========================================="
           echo "⏰ 时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
           echo "🎯 运行模式: $MODE"
+          echo "🌍 大盘区域: $MARKET_REVIEW_REGION"
           echo "📊 自选股: $STOCK_LIST"
           echo "📝 报告类型: $REPORT_TYPE"
           echo ""
