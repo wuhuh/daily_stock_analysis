@@ -60,7 +60,6 @@ jobs:
           print(text[:1800])
 
           required_log = [
-              '已启用美股 11 Sector SPDR ETF 领涨/领跌分析',
               '[USSector] rankings success',
               'anthropic/minimax-m3',
               'action=generate_review status=success',
@@ -77,6 +76,17 @@ jobs:
               raise SystemExit('US brief still uses old mainline-only block')
           if not re.search(r'\((?:XLK|XLC|XLY|XLF|XLI|XLB|XLE|XLP|XLV|XLU|XLRE)\)', text):
               raise SystemExit('US sector block does not show ETF proxy tickers')
+
+          up = re.search(r'\*\*领涨\*\*\s*(.*)', text)
+          down = re.search(r'\*\*领跌\*\*\s*(.*)', text)
+          if not up or not down:
+              raise SystemExit('Cannot parse sector blocks')
+          up_line, down_line = up.group(1), down.group(1)
+          if '无行业ETF收涨' not in up_line and re.search(r'\-\d+(?:\.\d+)?%', up_line):
+              raise SystemExit(f'Negative sector incorrectly shown as gainer: {up_line}')
+          if '无行业ETF收跌' not in down_line and re.search(r'\+\d+(?:\.\d+)?%', down_line):
+              raise SystemExit(f'Positive sector incorrectly shown as loser: {down_line}')
+
           if len(text) > 1400:
               raise SystemExit(f'Report too long: {len(text)} chars')
           if any(line.lstrip().startswith('|') for line in text.splitlines()):
