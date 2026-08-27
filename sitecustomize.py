@@ -112,7 +112,8 @@ def _compact_market_text(text: str, max_chars: int = 1150) -> str:
     """
 
     raw = str(text or "").strip()
-    if not raw or len(raw) <= max_chars:
+    has_table = any(line.lstrip().startswith("|") for line in raw.splitlines())
+    if not raw or (len(raw) <= max_chars and not has_table):
         return raw
 
     aliases: Dict[str, tuple[str, ...]] = {
@@ -273,6 +274,27 @@ def _install_market_review_patch() -> None:
     MarketAnalyzer._generate_template_review = brief_template
 
 
+def _install_core_market_review_patch() -> None:
+    """Stop the structured payload renderer from re-appending Top-5 tables.
+
+    ``MarketAnalyzer`` already returns a compact brief, but the outer market
+    review renderer has an independent compatibility step that adds sector
+    tables from ``payload['sectors']``.  Suppress only that extra block in brief
+    mode; full/dashboard reports retain the upstream structured tables.
+    """
+
+    from src.core import market_review as market_review_core
+
+    original_sector_renderer = market_review_core._render_sector_payload_markdown_block
+
+    def brief_sector_renderer(payload, *, title_prefix=""):
+        if _is_brief_mode():
+            return ""
+        return original_sector_renderer(payload, title_prefix=title_prefix)
+
+    market_review_core._render_sector_payload_markdown_block = brief_sector_renderer
+
+
 def _install_notification_patch() -> None:
     from src.notification import NotificationService
 
@@ -295,6 +317,7 @@ if _is_main_entrypoint():
     _configure_brief_delivery()
     try:
         _install_market_review_patch()
+        _install_core_market_review_patch()
         _install_notification_patch()
     except Exception:
         # sitecustomize must never make the application unstartable.  The normal
