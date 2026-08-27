@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Final compatibility shim for Exa's keyless hosted MCP search.
+"""Compatibility shim for Exa's keyless hosted MCP search.
 
 The public ``web_search_exa`` tool returns text blocks with ``Published:``
-metadata.  This provider parses that real date so the repository's existing
+metadata. This provider parses that real date so the repository's existing
 freshness filter can keep recent news instead of dropping it as undated.
 """
 
@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import time
+from datetime import date
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -37,21 +38,64 @@ def _json_object(raw: Any) -> Optional[Dict[str, Any]]:
 
 
 def _parse_envelope(body: str) -> Optional[Dict[str, Any]]:
-    direct = _json_object(str(body or "").strip())
+    """Parse JSON or Streamable-HTTP/SSE MCP responses defensively."""
+    text = str(body or "").lstrip("\ufeff").strip()
+    if not text:
+        return None
+
+    direct = _json_object(text)
     if direct is not None:
         return direct
 
     candidates: List[Dict[str, Any]] = []
-    for line in str(body or "").splitlines():
-        if not line.startswith("data:"):
-            continue
-        parsed = _json_object(line[5:].strip())
+    data_lines: List[str] = []
+
+    def flush_event() -> None:
+        if not data_lines:
+            return
+        payload = "\n".join(data_lines).strip()
+        data_lines.clear()
+        if not payload or payload == "[DONE]":
+            return
+        parsed = _json_object(payload)
         if parsed is not None:
             candidates.append(parsed)
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            flush_event()
+            continue
+        if line.lower().startswith("data:"):
+            data_lines.append(line.split(":", 1)[1].strip())
+    flush_event()
+
     for item in reversed(candidates):
         if "result" in item or "error" in item:
             return item
-    return candidates[-1] if candidates else None
+    if candidates:
+        return candidates[-1]
+
+    # Last-resort compatibility for SSE proxies that collapse framing into a
+    # single line or prepend transport metadata before the JSON-RPC payload.
+    marker = re.search(r"(?is)data:\s*(\{.*\})\s*$", text)
+    if marker:
+        parsed = _json_object(marker.group(1).strip())
+        if parsed is not None:
+            return parsed
+
+    json_start = text.find('{"result"')
+    if json_start < 0:
+        json_start = text.find('{"error"')
+    if json_start >= 0:
+        decoder = json.JSONDecoder()
+        try:
+            parsed, _ = decoder.raw_decode(text[json_start:])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
 def _collect_text(value: Any) -> str:
@@ -128,6 +172,20 @@ def _source(url: str) -> str:
         return "Exa"
 
 
+def _dated_query(query: str) -> str:
+    """Bias broad market searches toward current-day results without faking dates."""
+    text = str(query or "").strip()
+    if not text:
+        return text
+    today = date.today().isoformat()
+    if today in text:
+        return text
+    market_terms = ("A股", "股市", "市场", "大盘", "US stock", "S&P", "NASDAQ", "美股")
+    if any(term.lower() in text.lower() for term in market_terms):
+        return f"{text} {today}"
+    return text
+
+
 def install() -> None:
     if (os.getenv("EXA_MCP_SEARCH_ENABLED") or "true").strip().lower() in {
         "0", "false", "no", "off", "disabled"
@@ -163,6 +221,7 @@ def install() -> None:
                     error_message="搜索关键词为空",
                 )
 
+            request_query = _dated_query(search_query)
             body = {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -170,7 +229,7 @@ def install() -> None:
                 "params": {
                     "name": "web_search_exa",
                     "arguments": {
-                        "query": search_query,
+                        "query": request_query,
                         "numResults": requested,
                     },
                 },
@@ -184,74 +243,79 @@ def install() -> None:
             if exa_key:
                 headers["x-api-key"] = exa_key
 
-            try:
-                response = requests.post(_EXA_MCP_URL, headers=headers, json=body, timeout=20)
-                elapsed = time.time() - started
-                if response.status_code != 200:
-                    detail = (response.text or "").strip()[:300]
+            last_error: Optional[Exception] = None
+            for attempt in range(1, 3):
+                try:
+                    response = requests.post(_EXA_MCP_URL, headers=headers, json=body, timeout=20)
+                    if response.status_code != 200:
+                        detail = (response.text or "").strip()[:300]
+                        raise RuntimeError(f"HTTP {response.status_code}: {detail}")
+
+                    envelope = _parse_envelope(response.text)
+                    if envelope is None:
+                        content_type = response.headers.get("content-type", "")
+                        preview = re.sub(r"\s+", " ", (response.text or "").lstrip("\ufeff"))[:180]
+                        raise RuntimeError(
+                            f"Exa MCP 响应无法解析 (content-type={content_type}, preview={preview!r})"
+                        )
+                    error = envelope.get("error")
+                    if error:
+                        raise RuntimeError(str(error))
+
+                    rows = _parse_text_results(_collect_text(envelope.get("result", envelope)))
+                    results: List[SearchResult] = []
+                    for row in rows:
+                        url = str(row.get("url") or "").strip()
+                        if not url:
+                            continue
+                        snippet = re.sub(r"\s+", " ", str(row.get("text") or "")).strip()[:700]
+                        results.append(
+                            SearchResult(
+                                title=str(row.get("title") or url).strip()[:180],
+                                snippet=snippet,
+                                url=url,
+                                source=_source(url),
+                                published_date=_published_date(row),
+                            )
+                        )
+                        if len(results) >= requested:
+                            break
+
+                    elapsed = time.time() - started
+                    dated = sum(1 for item in results if item.published_date)
+                    logger.info(
+                        "[%s] 搜索 '%s' 完成，返回 %s 条（有日期 %s 条），耗时 %.2fs%s%s",
+                        self.name,
+                        request_query,
+                        len(results),
+                        dated,
+                        elapsed,
+                        "（API Key）" if exa_key else "（公共 MCP）",
+                        f"，第 {attempt} 次尝试" if attempt > 1 else "",
+                    )
                     return SearchResponse(
                         query=query,
-                        results=[],
+                        results=results,
                         provider=self.name,
-                        success=False,
-                        error_message=f"HTTP {response.status_code}: {detail}",
+                        success=True,
                         search_time=elapsed,
                     )
-
-                envelope = _parse_envelope(response.text)
-                if envelope is None:
-                    raise RuntimeError("Exa MCP 响应无法解析")
-                error = envelope.get("error")
-                if error:
-                    raise RuntimeError(str(error))
-
-                rows = _parse_text_results(_collect_text(envelope.get("result", envelope)))
-                results: List[SearchResult] = []
-                for row in rows:
-                    url = str(row.get("url") or "").strip()
-                    if not url:
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < 2:
+                        logger.info("[%s] 第 %s 次搜索失败，立即重试: %s", self.name, attempt, exc)
                         continue
-                    snippet = re.sub(r"\s+", " ", str(row.get("text") or "")).strip()[:700]
-                    results.append(
-                        SearchResult(
-                            title=str(row.get("title") or url).strip()[:180],
-                            snippet=snippet,
-                            url=url,
-                            source=_source(url),
-                            published_date=_published_date(row),
-                        )
-                    )
-                    if len(results) >= requested:
-                        break
 
-                dated = sum(1 for item in results if item.published_date)
-                logger.info(
-                    "[%s] 搜索 '%s' 完成，返回 %s 条（有日期 %s 条），耗时 %.2fs%s",
-                    self.name,
-                    search_query,
-                    len(results),
-                    dated,
-                    elapsed,
-                    "（API Key）" if exa_key else "（公共 MCP）",
-                )
-                return SearchResponse(
-                    query=query,
-                    results=results,
-                    provider=self.name,
-                    success=True,
-                    search_time=elapsed,
-                )
-            except Exception as exc:
-                elapsed = time.time() - started
-                logger.warning("[%s] 搜索失败: %s", self.name, exc)
-                return SearchResponse(
-                    query=query,
-                    results=[],
-                    provider=self.name,
-                    success=False,
-                    error_message=str(exc),
-                    search_time=elapsed,
-                )
+            elapsed = time.time() - started
+            logger.warning("[%s] 搜索失败: %s", self.name, last_error)
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=str(last_error or "Exa MCP 搜索失败"),
+                search_time=elapsed,
+            )
 
     original_init = SearchService.__init__
 
