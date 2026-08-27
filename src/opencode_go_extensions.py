@@ -77,7 +77,7 @@ def _parse_mcp_envelope(body: str) -> Optional[Dict[str, Any]]:
             candidates.append(parsed)
 
     # Streamable HTTP may emit progress/metadata events before the actual tool
-    # result.  Prefer the last result/error message instead of the first event.
+    # result. Prefer the last result/error message instead of the first event.
     for item in reversed(candidates):
         if "result" in item or "error" in item:
             return item
@@ -92,7 +92,7 @@ def _find_results(value: Any) -> Optional[List[Dict[str, Any]]]:
             return [row for row in rows if isinstance(row, dict)]
 
         # Advanced Exa MCP commonly serializes its structured payload into a
-        # text content item.  Decode JSON-looking text before falling back.
+        # text content item. Decode JSON-looking text before falling back.
         content = value.get("content")
         if isinstance(content, list):
             for item in content:
@@ -423,8 +423,27 @@ def _insert_before_tail(text: str, block: str) -> str:
     return text.rstrip() + "\n" + block
 
 
+def _replace_labeled_block(text: str, label: str, block: str) -> str:
+    """Replace a whole brief-report block up to the next decision label."""
+    if not block:
+        return text
+    pattern = re.compile(
+        rf"\*\*{re.escape(label)}\*\*[\s\S]*?(?=\n\s*\*\*(?:领涨|领跌|消息|关注|风险|结论)\*\*|$)"
+    )
+    replacement = f"**{label}** {block}"
+    if pattern.search(text):
+        return pattern.sub(replacement, text, count=1)
+    return _insert_before_tail(text, replacement)
+
+
 def _ensure_cn_sector_balance(text: str, overview: Any) -> str:
-    """Deterministically keep both strongest and weakest A-share sectors."""
+    """Ground strongest/weakest A-share blocks in structured ranking data.
+
+    The model still interprets the whole market and reliable news, but sector
+    names and percentage moves are rendered deterministically here.  This avoids
+    turning unsupported guesses such as "资金切换" or "预期走弱" into apparent
+    facts when the news search did not actually establish those causes.
+    """
     report = str(text or "").strip()
     if not report:
         return report
@@ -435,15 +454,21 @@ def _ensure_cn_sector_balance(text: str, overview: Any) -> str:
     if "**领涨**" not in report and "**主线**" in report:
         report = report.replace("**主线**", "**领涨**", 1)
 
-    if "**领涨**" not in report:
-        summary = _ranking_summary(top_rows)
-        if summary:
-            report = _insert_before_tail(report, f"**领涨** {summary}")
+    top_summary = _ranking_summary(top_rows)
+    if top_summary:
+        report = _replace_labeled_block(
+            report,
+            "领涨",
+            f"{top_summary}。强势方向以当日行情排名为准，关注次日量价能否延续。",
+        )
 
-    if "**领跌**" not in report:
-        summary = _ranking_summary(bottom_rows)
-        if summary:
-            report = _insert_before_tail(report, f"**领跌** {summary}")
+    bottom_summary = _ranking_summary(bottom_rows)
+    if bottom_summary:
+        report = _replace_labeled_block(
+            report,
+            "领跌",
+            f"{bottom_summary}。弱势方向以当日行情排名为准，关注弱势是否继续扩散。",
+        )
 
     return report
 
@@ -465,9 +490,10 @@ def _install_balanced_sector_brief_patch() -> None:
 【A股板块双向覆盖规则｜优先级高于上面的简报格式】
 最终 A 股简报不能只写上涨主线，必须同时记录当日最强与最弱板块：
 - 将原来的“主线”拆为“领涨”和“领跌”两个独立信息块。
-- 领涨：从输入的行业/概念领涨榜选 1-2 个最强方向，写“板块 + 涨幅 + 一句话判断”。
-- 领跌：从输入的行业/概念领跌榜选 1-2 个最弱方向，写“板块 + 跌幅 + 一句话判断”。
-- 涨跌幅必须来自输入数据；没有可靠新闻解释原因时，只做盘面判断，不得编造政策、资金或消息原因。
+- 领涨：从输入的行业/概念领涨榜选 1-2 个最强方向，记录板块与涨幅，并只写持续性观察。
+- 领跌：从输入的行业/概念领跌榜选 1-2 个最弱方向，记录板块与跌幅，并只写扩散性观察。
+- 涨跌幅必须来自输入数据；板块涨跌原因只有在可靠新闻明确支持时才允许写在“消息”中。
+- 不得把“资金切换、政策预期、兑现、补跌、消费预期”等推测性原因写成板块事实。
 - 关注与结论同时考虑强势方向的持续性和弱势方向是否扩散。
 - 保持 900 字以内，禁止 Markdown 表格。
 - 顺序固定：市场、领涨、领跌、消息、关注、风险、结论。
@@ -476,13 +502,9 @@ def _install_balanced_sector_brief_patch() -> None:
 ## A股简报
 > 一句话市场状态
 **市场** 指数/情绪/成交核心数据
-**领涨**
-- 最强板块1：涨幅 + 判断
-- 最强板块2：涨幅 + 判断
-**领跌**
-- 最弱板块1：跌幅 + 判断
-- 最弱板块2：跌幅 + 判断
-**消息** 最多2条可靠增量新闻
+**领涨** 最强板块1 + 涨幅；最强板块2 + 涨幅；一句持续性观察
+**领跌** 最弱板块1 + 跌幅；最弱板块2 + 跌幅；一句扩散性观察
+**消息** 最多2条有可靠来源的增量新闻/催化
 **关注** 强势延续观察点；弱势扩散观察点
 **风险** 一句话
 **结论** 一句话概括市场强弱、最强/最弱方向和操作节奏
