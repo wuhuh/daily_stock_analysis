@@ -19,6 +19,15 @@ from typing import Dict, List
 # /v1/messages to api_base, so the configured base must stop at /zen/go.
 _OPENCODE_GO_ANTHROPIC_BASE = "https://opencode.ai/zen/go"
 _OPENCODE_GO_MINIMAX_MODEL = "minimax-m3"
+_SEARCH_PROVIDER_ENV_VARS = (
+    "ANSPIRE_API_KEYS",
+    "BOCHA_API_KEYS",
+    "TAVILY_API_KEYS",
+    "SERPAPI_API_KEYS",
+    "MINIMAX_API_KEYS",
+    "BRAVE_API_KEYS",
+    "SEARXNG_BASE_URLS",
+)
 
 
 def _is_main_entrypoint() -> bool:
@@ -56,6 +65,24 @@ def _configure_opencode_go_minimax() -> None:
     os.environ["LLM_MINIMAX_MODELS"] = _OPENCODE_GO_MINIMAX_MODEL
     os.environ["LLM_MINIMAX_ENABLED"] = "true"
     os.environ["LITELLM_MODEL"] = f"anthropic/{_OPENCODE_GO_MINIMAX_MODEL}"
+
+
+def _configure_search_fallback() -> None:
+    """Enable a keyless news-search fallback when no dedicated provider exists.
+
+    The OpenCode Go model key is intentionally *not* reused as MINIMAX_API_KEYS:
+    OpenCode Go exposes the model inference endpoint, while this project's
+    MiniMax search provider calls a different MiniMax Coding Plan search API.
+    """
+
+    if any((os.getenv(name) or "").strip() for name in _SEARCH_PROVIDER_ENV_VARS):
+        return
+
+    # Respect an explicit user choice.  Only default to public SearXNG when the
+    # setting is absent, so users can still force-disable public instances.
+    public_flag = os.getenv("SEARXNG_PUBLIC_INSTANCES_ENABLED")
+    if public_flag is None or not public_flag.strip():
+        os.environ["SEARXNG_PUBLIC_INSTANCES_ENABLED"] = "true"
 
 
 def _configure_brief_delivery() -> None:
@@ -264,6 +291,7 @@ def _install_notification_patch() -> None:
 
 if _is_main_entrypoint():
     _configure_opencode_go_minimax()
+    _configure_search_fallback()
     _configure_brief_delivery()
     try:
         _install_market_review_patch()
