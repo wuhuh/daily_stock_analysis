@@ -1,0 +1,65 @@
+name: Market Analysis Smoke Test
+
+on:
+  push:
+    branches:
+      - test/market-analysis-smoke
+
+permissions:
+  contents: read
+
+jobs:
+  market-smoke:
+    runs-on: ubuntu-latest
+    environment: STOCK_LIST
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        region: [cn, us]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run market review smoke test
+        env:
+          GENERATION_FALLBACK_BACKEND: litellm
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || secrets.OPENAI_MODEL }}
+          MARKET_REVIEW_ENABLED: 'true'
+          MARKET_REVIEW_REGION: ${{ matrix.region }}
+          MARKET_REVIEW_COLOR_SCHEME: ${{ vars.MARKET_REVIEW_COLOR_SCHEME || secrets.MARKET_REVIEW_COLOR_SCHEME || 'green_up' }}
+          REPORT_TYPE: brief
+          TRADING_DAY_CHECK_ENABLED: 'false'
+          LOG_LEVEL: INFO
+          MAX_WORKERS: '1'
+          REALTIME_SOURCE_PRIORITY: ${{ vars.REALTIME_SOURCE_PRIORITY || 'tencent,akshare_sina,efinance,akshare_em' }}
+          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+          WECHAT_MSG_TYPE: ${{ vars.WECHAT_MSG_TYPE || secrets.WECHAT_MSG_TYPE || 'markdown' }}
+        run: |
+          mkdir -p data logs reports
+          echo "Smoke testing MARKET_REVIEW_REGION=${MARKET_REVIEW_REGION}"
+          python main.py --market-review --force-run
+
+      - name: Upload smoke-test reports
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: market-smoke-${{ matrix.region }}-${{ github.run_number }}
+          path: |
+            reports/
+            logs/
+          retention-days: 7
