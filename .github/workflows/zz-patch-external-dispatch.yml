@@ -38,8 +38,10 @@ jobs:
               raise SystemExit('expected workflow_dispatch input block not found')
           text = text.replace(old_inputs, new_inputs, 1)
 
-          old_dispatch = """          else\n            MODE=\"${{ github.event.inputs.mode || 'full' }}\"\n          fi\n"""
-          new_dispatch = """          else\n            MODE=\"${{ github.event.inputs.mode || 'full' }}\"\n            export MARKET_REVIEW_REGION=\"${{ github.event.inputs.region || 'cn' }}\"\n            echo \"🌍 手动/外部调度：大盘区域=$MARKET_REVIEW_REGION\"\n          fi\n"""
+          mode_expr = '$' + "{{ github.event.inputs.mode || 'full' }}"
+          region_expr = '$' + "{{ github.event.inputs.region || 'cn' }}"
+          old_dispatch = f"""          else\n            MODE=\"{mode_expr}\"\n          fi\n"""
+          new_dispatch = f"""          else\n            MODE=\"{mode_expr}\"\n            export MARKET_REVIEW_REGION=\"{region_expr}\"\n            echo \"🌍 手动/外部调度：大盘区域=$MARKET_REVIEW_REGION\"\n          fi\n"""
           if old_dispatch not in text:
               raise SystemExit('expected dispatch mode block not found')
           text = text.replace(old_dispatch, new_dispatch, 1)
