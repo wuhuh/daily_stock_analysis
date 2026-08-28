@@ -1,0 +1,19 @@
+name: Schedule Resync Probe
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: '*/5 * * * *'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Show trigger info
+        run: |
+          echo "event_name=${{ github.event_name }}"
+          echo "schedule=${{ github.event.schedule }}"
+          echo "utc=$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "beijing=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S CST')"
