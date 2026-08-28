@@ -1,16 +1,7 @@
 name: 每日股票分析
 
 on:
-  schedule:
-    # GitHub cron 使用 UTC。以下时间对应北京时间（UTC+8）。
-    # 09:05：推送上一交易时段的美股大盘复盘（仅大盘）
-    - cron: '5 1 * * 1-5'
-    # 11:35：A股午间休市后，推送大盘 + 自选股
-    - cron: '35 3 * * 1-5'
-    # 15:10：A股收盘后，推送大盘 + 自选股
-    - cron: '10 7 * * 1-5'
-
-  # 手动触发
+  # 手动触发，也供 cron-job.org 通过 workflow_dispatch 调用
   workflow_dispatch:
     inputs:
       mode:
@@ -22,6 +13,14 @@ on:
           - full          # 完整分析（股票+大盘）
           - market-only   # 仅大盘复盘
           - stocks-only   # 仅股票分析
+      region:
+        description: '大盘区域'
+        required: true
+        default: 'cn'
+        type: choice
+        options:
+          - cn
+          - us
       force_run:
         description: '强制运行（跳过交易日检查）'
         required: false
@@ -478,6 +477,8 @@ jobs:
             esac
           else
             MODE="${{ github.event.inputs.mode || 'full' }}"
+            export MARKET_REVIEW_REGION="${{ github.event.inputs.region || 'cn' }}"
+            echo "🌍 手动/外部调度：大盘区域=$MARKET_REVIEW_REGION"
           fi
 
           # 上游当前 aggregate renderer 中 simple/full 会共同进入 dashboard。

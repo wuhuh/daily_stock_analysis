@@ -1,2 +1,0 @@
-GitHub Actions scheduler resync marker.
-Created to force a fresh commit on the default branch without changing workflow logic.
