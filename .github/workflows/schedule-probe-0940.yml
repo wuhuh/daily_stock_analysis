@@ -1,0 +1,18 @@
+name: Schedule Probe 09:40
+
+on:
+  schedule:
+    # GitHub cron 使用 UTC；01:40 UTC = 北京时间 09:40
+    - cron: '40 1 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show trigger info
+        run: |
+          echo "event=${{ github.event_name }}"
+          echo "schedule=${{ github.event.schedule }}"
+          echo "utc=$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "beijing=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S CST')"
