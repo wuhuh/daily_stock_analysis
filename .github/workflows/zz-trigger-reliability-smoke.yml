@@ -1,0 +1,24 @@
+name: Trigger market review reliability smoke
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zz-trigger-reliability-smoke.yml'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch A-share market-only smoke
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run 00-daily-analysis.yml \
+            --repo ${{ github.repository }} \
+            -f mode=market-only \
+            -f region=cn \
+            -f force_run=true
