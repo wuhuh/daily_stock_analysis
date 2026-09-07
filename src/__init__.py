@@ -39,6 +39,15 @@ if os.path.basename(sys.argv[0] or "") == "main.py":
     except ImportError:
         pass
 
+    # Production reliability fixes: OpenCode Go session header, market-news
+    # relevance semantics, and a non-Eastmoney A-share concept ranking fallback.
+    try:
+        from src.runtime_reliability_patch import install as _install_runtime_reliability_patch
+
+        _install_runtime_reliability_patch()
+    except ImportError:
+        pass
+
     # US market sector breadth: use the 11 Select Sector SPDR ETFs as liquid
     # GICS-sector proxies and inject deterministic leading/lagging blocks into
     # the concise market review.
