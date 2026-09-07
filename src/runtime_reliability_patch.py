@@ -8,9 +8,10 @@ Fixes:
 1. OpenCode Go now requires ``x-opencode-session``. Inject a stable per-run
    session header (and a specific User-Agent) for requests routed to
    ``opencode.ai/zen/go``.
-2. Market-review news uses the pseudo target ``market``. Sector/macro news is
-   valid first-class evidence for that target, so promote it to direct news and
-   stop needlessly falling through from Exa to unreliable public SearXNG.
+2. Market-review news uses the pseudo target ``market``. Route it through the
+   topic/macro search path instead of single-stock identity ranking, so a good
+   Exa result is accepted immediately instead of falling through to public
+   SearXNG merely because no ticker/company name is present.
 3. Eastmoney concept ranking is intermittently unavailable from GitHub-hosted
    runners. Prefer AkShare's Tonghuashun concept-fund-flow endpoint on Actions,
    with the original Eastmoney implementation retained as fallback.
@@ -126,54 +127,41 @@ def _install_opencode_go_headers() -> None:
 
 
 def _install_market_news_relevance_fix() -> None:
-    """Treat sector/macro items as first-class evidence for market reviews."""
+    """Use topic-news semantics for the market-review pseudo target."""
     try:
         from src.search_service import SearchService
 
-        original_rank = SearchService._rank_news_response
-        if getattr(original_rank, "_dsa_market_news_patch", False):
+        original_search_stock_news = SearchService.search_stock_news
+        if getattr(original_search_stock_news, "_dsa_market_news_patch", False):
             return
 
-        @classmethod
-        def patched_rank(
-            cls: Any,
-            response: Any,
-            *,
+        @functools.wraps(original_search_stock_news)
+        def patched_search_stock_news(
+            self: Any,
             stock_code: str,
             stock_name: str,
-            prefer_chinese: bool,
-            max_results: int,
-            log_scope: str,
+            max_results: int = 5,
+            focus_keywords: Optional[List[str]] = None,
         ) -> Any:
-            ranked = original_rank(
-                response,
-                stock_code=stock_code,
-                stock_name=stock_name,
-                prefer_chinese=prefer_chinese,
+            if str(stock_code or "").strip().lower() == "market":
+                logger.info(
+                    "[大盘新闻] 使用题材/宏观新闻搜索路径，避免按个股代码/公司名过滤"
+                )
+                return self.search_topic_news(
+                    stock_name or "大盘",
+                    max_results=max_results,
+                    focus_keywords=focus_keywords,
+                )
+            return original_search_stock_news(
+                self,
+                stock_code,
+                stock_name,
                 max_results=max_results,
-                log_scope=log_scope,
+                focus_keywords=focus_keywords,
             )
-            if str(stock_code or "").strip().lower() != "market" or not getattr(ranked, "results", None):
-                return ranked
 
-            promoted = 0
-            for item in ranked.results:
-                category = getattr(item, "relevance_category", None)
-                if category not in {cls._SECTOR_NEWS_CATEGORY, cls._MACRO_NEWS_CATEGORY}:
-                    continue
-                item.relevance_category = cls._DIRECT_NEWS_CATEGORY
-                item.relevance_score = max(int(getattr(item, "relevance_score", 0) or 0), 60)
-                reasons = list(getattr(item, "relevance_reasons", None) or [])
-                reasons.append("大盘复盘接受板块/宏观市场新闻")
-                item.relevance_reasons = reasons
-                promoted += 1
-
-            if promoted:
-                logger.info("[大盘新闻] 将 %s 条板块/宏观新闻提升为有效大盘新闻，避免无效搜索降级", promoted)
-            return ranked
-
-        patched_rank._dsa_market_news_patch = True  # type: ignore[attr-defined]
-        SearchService._rank_news_response = patched_rank
+        patched_search_stock_news._dsa_market_news_patch = True  # type: ignore[attr-defined]
+        SearchService.search_stock_news = patched_search_stock_news
     except Exception as exc:
         logger.warning("Market news relevance patch skipped: %s", exc)
 
